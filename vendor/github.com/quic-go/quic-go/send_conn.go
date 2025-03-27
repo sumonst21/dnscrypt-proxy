@@ -1,9 +1,8 @@
 package quic
 
 import (
-	"fmt"
-	"math"
 	"net"
+	"sync/atomic"
 
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/utils"
@@ -11,26 +10,35 @@ import (
 
 // A sendConn allows sending using a simple Write() on a non-connected packet conn.
 type sendConn interface {
-	Write(b []byte, size protocol.ByteCount) error
+	Write(b []byte, gsoSize uint16, ecn protocol.ECN) error
+	WriteTo([]byte, net.Addr) error
 	Close() error
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
+	ChangeRemoteAddr(addr net.Addr, info packetInfo)
 
 	capabilities() connCapabilities
+}
+
+type remoteAddrInfo struct {
+	addr net.Addr
+	oob  []byte
 }
 
 type sconn struct {
 	rawConn
 
-	localAddr  net.Addr
-	remoteAddr net.Addr
+	localAddr net.Addr
+
+	remoteAddrInfo atomic.Pointer[remoteAddrInfo]
 
 	logger utils.Logger
 
-	info packetInfo
-	oob  []byte
 	// If GSO enabled, and we receive a GSO error for this remote address, GSO is disabled.
 	gotGSOError bool
+	// Used to catch the error sometimes returned by the first sendmsg call on Linux,
+	// see https://github.com/golang/go/issues/63322.
+	wroteFirstPacket bool
 }
 
 var _ sendConn = &sconn{}
@@ -46,52 +54,57 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
 	}
 
 	oob := info.OOB()
-	// add 32 bytes, so we can add the UDP_SEGMENT msg
+	// increase oob slice capacity, so we can add the UDP_SEGMENT and ECN control messages without allocating
 	l := len(oob)
-	oob = append(oob, make([]byte, 32)...)
-	oob = oob[:l]
-	return &sconn{
-		rawConn:    c,
-		localAddr:  localAddr,
-		remoteAddr: remote,
-		info:       info,
-		oob:        oob,
-		logger:     logger,
+	oob = append(oob, make([]byte, 64)...)[:l]
+	sc := &sconn{
+		rawConn:   c,
+		localAddr: localAddr,
+		logger:    logger,
 	}
+	sc.remoteAddrInfo.Store(&remoteAddrInfo{
+		addr: remote,
+		oob:  oob,
+	})
+	return sc
 }
 
-func (c *sconn) Write(p []byte, size protocol.ByteCount) error {
-	if !c.capabilities().GSO {
-		if protocol.ByteCount(len(p)) != size {
-			panic(fmt.Sprintf("inconsistent packet size (%d vs %d)", len(p), size))
-		}
-		_, err := c.WritePacket(p, c.remoteAddr, c.oob)
-		return err
-	}
-	// GSO is supported. Append the control message and send.
-	if size > math.MaxUint16 {
-		panic("size overflow")
-	}
-	_, err := c.WritePacket(p, c.remoteAddr, appendUDPSegmentSizeMsg(c.oob, uint16(size)))
+func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
+	ai := c.remoteAddrInfo.Load()
+	err := c.writePacket(p, ai.addr, ai.oob, gsoSize, ecn)
 	if err != nil && isGSOError(err) {
 		// disable GSO for future calls
 		c.gotGSOError = true
 		if c.logger.Debug() {
-			c.logger.Debugf("GSO failed when sending to %s", c.remoteAddr)
+			c.logger.Debugf("GSO failed when sending to %s", ai.addr)
 		}
 		// send out the packets one by one
 		for len(p) > 0 {
 			l := len(p)
-			if l > int(size) {
-				l = int(size)
+			if l > int(gsoSize) {
+				l = int(gsoSize)
 			}
-			if _, err := c.WritePacket(p[:l], c.remoteAddr, c.oob); err != nil {
+			if err := c.writePacket(p[:l], ai.addr, ai.oob, 0, ecn); err != nil {
 				return err
 			}
 			p = p[l:]
 		}
 		return nil
 	}
+	return err
+}
+
+func (c *sconn) writePacket(p []byte, addr net.Addr, oob []byte, gsoSize uint16, ecn protocol.ECN) error {
+	_, err := c.WritePacket(p, addr, oob, gsoSize, ecn)
+	if err != nil && !c.wroteFirstPacket && isPermissionError(err) {
+		_, err = c.WritePacket(p, addr, oob, gsoSize, ecn)
+	}
+	c.wroteFirstPacket = true
+	return err
+}
+
+func (c *sconn) WriteTo(b []byte, addr net.Addr) error {
+	_, err := c.WritePacket(b, addr, nil, 0, protocol.ECNUnsupported)
 	return err
 }
 
@@ -103,5 +116,12 @@ func (c *sconn) capabilities() connCapabilities {
 	return capabilities
 }
 
-func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddr }
+func (c *sconn) ChangeRemoteAddr(addr net.Addr, info packetInfo) {
+	c.remoteAddrInfo.Store(&remoteAddrInfo{
+		addr: addr,
+		oob:  info.OOB(),
+	})
+}
+
+func (c *sconn) RemoteAddr() net.Addr { return c.remoteAddrInfo.Load().addr }
 func (c *sconn) LocalAddr() net.Addr  { return c.localAddr }

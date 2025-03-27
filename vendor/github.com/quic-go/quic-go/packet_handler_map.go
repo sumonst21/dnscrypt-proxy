@@ -1,11 +1,6 @@
 package quic
 
 import (
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"errors"
-	"hash"
 	"io"
 	"net"
 	"sync"
@@ -21,14 +16,17 @@ type connCapabilities struct {
 	DF bool
 	// GSO (Generic Segmentation Offload) supported
 	GSO bool
+	// ECN (Explicit Congestion Notifications) supported
+	ECN bool
 }
 
 // rawConn is a connection that allow reading of a receivedPackeh.
 type rawConn interface {
 	ReadPacket() (receivedPacket, error)
 	// WritePacket writes a packet on the wire.
-	// If GSO is enabled, it's the caller's responsibility to set the correct control message.
-	WritePacket(b []byte, addr net.Addr, oob []byte) (int, error)
+	// gsoSize is the size of a single packet, or 0 to disable GSO.
+	// It is invalid to set gsoSize if capabilities.GSO is not set.
+	WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error)
 	LocalAddr() net.Addr
 	SetReadDeadline(time.Time) error
 	io.Closer
@@ -42,13 +40,6 @@ type closePacket struct {
 	info    packetInfo
 }
 
-type unknownPacketHandler interface {
-	handlePacket(receivedPacket)
-	setCloseError(error)
-}
-
-var errListenerAlreadySet = errors.New("listener already set")
-
 type packetHandlerMap struct {
 	mutex       sync.Mutex
 	handlers    map[protocol.ConnectionID]packetHandler
@@ -61,15 +52,12 @@ type packetHandlerMap struct {
 
 	deleteRetiredConnsAfter time.Duration
 
-	statelessResetMutex  sync.Mutex
-	statelessResetHasher hash.Hash
-
 	logger utils.Logger
 }
 
 var _ packetHandlerManager = &packetHandlerMap{}
 
-func newPacketHandlerMap(key *StatelessResetKey, enqueueClosePacket func(closePacket), logger utils.Logger) *packetHandlerMap {
+func newPacketHandlerMap(enqueueClosePacket func(closePacket), logger utils.Logger) *packetHandlerMap {
 	h := &packetHandlerMap{
 		closeChan:               make(chan struct{}),
 		handlers:                make(map[protocol.ConnectionID]packetHandler),
@@ -77,9 +65,6 @@ func newPacketHandlerMap(key *StatelessResetKey, enqueueClosePacket func(closePa
 		deleteRetiredConnsAfter: protocol.RetiredConnectionIDDeleteTimeout,
 		enqueueClosePacket:      enqueueClosePacket,
 		logger:                  logger,
-	}
-	if key != nil {
-		h.statelessResetHasher = hmac.New(sha256.New, key[:])
 	}
 	if h.logger.Debug() {
 		go h.logUsage()
@@ -134,7 +119,7 @@ func (h *packetHandlerMap) Add(id protocol.ConnectionID, handler packetHandler) 
 	return true
 }
 
-func (h *packetHandlerMap) AddWithConnID(clientDestConnID, newConnID protocol.ConnectionID, fn func() (packetHandler, bool)) bool {
+func (h *packetHandlerMap) AddWithConnID(clientDestConnID, newConnID protocol.ConnectionID, handler packetHandler) bool {
 	h.mutex.Lock()
 	defer h.mutex.Unlock()
 
@@ -142,12 +127,8 @@ func (h *packetHandlerMap) AddWithConnID(clientDestConnID, newConnID protocol.Co
 		h.logger.Debugf("Not adding connection ID %s for a new connection, as it already exists.", clientDestConnID)
 		return false
 	}
-	conn, ok := fn()
-	if !ok {
-		return false
-	}
-	h.handlers[clientDestConnID] = conn
-	h.handlers[newConnID] = conn
+	h.handlers[clientDestConnID] = handler
+	h.handlers[newConnID] = handler
 	h.logger.Debugf("Adding connection IDs %s and %s for a new connection.", clientDestConnID, newConnID)
 	return true
 }
@@ -173,18 +154,17 @@ func (h *packetHandlerMap) Retire(id protocol.ConnectionID) {
 // Depending on which side closed the connection, we need to:
 // * remote close: absorb delayed packets
 // * local close: retransmit the CONNECTION_CLOSE packet, in case it was lost
-func (h *packetHandlerMap) ReplaceWithClosed(ids []protocol.ConnectionID, pers protocol.Perspective, connClosePacket []byte) {
+func (h *packetHandlerMap) ReplaceWithClosed(ids []protocol.ConnectionID, connClosePacket []byte) {
 	var handler packetHandler
 	if connClosePacket != nil {
 		handler = newClosedLocalConn(
 			func(addr net.Addr, info packetInfo) {
 				h.enqueueClosePacket(closePacket{payload: connClosePacket, addr: addr, info: info})
 			},
-			pers,
 			h.logger,
 		)
 	} else {
-		handler = newClosedRemoteConn(pers)
+		handler = newClosedRemoteConn()
 	}
 
 	h.mutex.Lock()
@@ -196,7 +176,6 @@ func (h *packetHandlerMap) ReplaceWithClosed(ids []protocol.ConnectionID, pers p
 
 	time.AfterFunc(h.deleteRetiredConnsAfter, func() {
 		h.mutex.Lock()
-		handler.shutdown()
 		for _, id := range ids {
 			delete(h.handlers, id)
 		}
@@ -225,23 +204,6 @@ func (h *packetHandlerMap) GetByResetToken(token protocol.StatelessResetToken) (
 	return handler, ok
 }
 
-func (h *packetHandlerMap) CloseServer() {
-	h.mutex.Lock()
-	var wg sync.WaitGroup
-	for _, handler := range h.handlers {
-		if handler.getPerspective() == protocol.PerspectiveServer {
-			wg.Add(1)
-			go func(handler packetHandler) {
-				// blocks until the CONNECTION_CLOSE has been sent and the run-loop has stopped
-				handler.shutdown()
-				wg.Done()
-			}(handler)
-		}
-	}
-	h.mutex.Unlock()
-	wg.Wait()
-}
-
 func (h *packetHandlerMap) Close(e error) {
 	h.mutex.Lock()
 
@@ -263,21 +225,4 @@ func (h *packetHandlerMap) Close(e error) {
 	h.closed = true
 	h.mutex.Unlock()
 	wg.Wait()
-}
-
-func (h *packetHandlerMap) GetStatelessResetToken(connID protocol.ConnectionID) protocol.StatelessResetToken {
-	var token protocol.StatelessResetToken
-	if h.statelessResetHasher == nil {
-		// Return a random stateless reset token.
-		// This token will be sent in the server's transport parameters.
-		// By using a random token, an off-path attacker won't be able to disrupt the connection.
-		rand.Read(token[:])
-		return token
-	}
-	h.statelessResetMutex.Lock()
-	h.statelessResetHasher.Write(connID.Bytes())
-	copy(token[:], h.statelessResetHasher.Sum(nil))
-	h.statelessResetHasher.Reset()
-	h.statelessResetMutex.Unlock()
-	return token
 }
