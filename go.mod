@@ -1,6 +1,6 @@
 module github.com/dnscrypt/dnscrypt-proxy
 
-go 1.21
+go 1.23.4
 
 require (
 	github.com/BurntSushi/toml v1.5.0
@@ -19,14 +19,14 @@ require (
 	github.com/jedisct1/go-sieve-cache v0.1.7
 	github.com/jedisct1/xsecretbox v0.0.0-20241212092125-3afc4917ac41
 	github.com/k-sone/critbitgo v1.4.0
-	github.com/kardianos/service v1.2.2
+	github.com/kardianos/service v1.2.4
 	github.com/lifenjoiner/dhcpdns v0.0.7
 	github.com/miekg/dns v1.1.66
 	github.com/powerman/check v1.8.0
 	github.com/quic-go/quic-go v0.52.0
 	golang.org/x/crypto v0.39.0
 	golang.org/x/net v0.41.0
-	golang.org/x/sys v0.33.0
+	golang.org/x/sys v0.34.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 )
 
